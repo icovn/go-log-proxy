@@ -4,94 +4,202 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"time"
 )
 
 var (
-	logFile *os.File
+	logFile   *os.File
+	batchLock sync.Mutex
+	batch     []LokiStream
 )
 
-func init() {
+type LokiStream struct {
+	Stream map[string]string `json:"stream"`
+	Values [][]string        `json:"values"`
+}
+
+type LokiPayload struct {
+	Streams []LokiStream `json:"streams"`
+}
+
+func main() {
+	initLogger()
+	go startHTTP(":8080")
+	go startTCP(":9000")
+	go batchSender()
+
+	select {}
+}
+
+func initLogger() {
 	os.Mkdir("logs", 0755)
 	var err error
 	logFile, err = os.OpenFile("logs/app.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatalf("Error opening log file: %v", err)
+		log.Fatalf("failed to open log file: %v", err)
 	}
 }
 
-func logAndWrite(msg json.RawMessage) {
-	// Minimize/compact the JSON
-	var compacted bytes.Buffer
-	if err := json.Compact(&compacted, msg); err != nil {
-		// log.Println("Failed to compact JSON:", err)
-		return
+func startHTTP(addr string) {
+	http.HandleFunc("/log", httpHandler)
+	log.Printf("HTTP server listening on %s\n", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("HTTP server error: %v", err)
 	}
-
-	log.Println(compacted.String())
-	logFile.Write(compacted.Bytes())
-	logFile.Write([]byte("\n"))
-
-	// Send to Loki
-	SendToLoki(msg)
 }
-
 func httpHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	var msg json.RawMessage
-	err := json.NewDecoder(r.Body).Decode(&msg)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var data map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	logAndWrite(msg)
-	w.WriteHeader(http.StatusOK)
+	processMessage(data)
+	w.Write([]byte("received"))
 }
 
-func tcpListener() {
-	ln, err := net.Listen("tcp", ":9000")
+func startTCP(addr string) {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("TCP error: %v", err)
 	}
+	defer ln.Close()
+
+	log.Printf("TCP server listening on %s\n", addr)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Println("TCP accept error:", err)
+			log.Println("Accept error:", err)
 			continue
 		}
-		go handleTCP(conn)
+		go handleTCPConnection(conn)
 	}
 }
-
-func handleTCP(conn net.Conn) {
+func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Println("TCP read error:", err)
-			}
-			break
-		}
-		var msg json.RawMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		var data map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &data); err != nil {
 			log.Println("Invalid JSON:", err)
 			continue
 		}
-		logAndWrite(msg)
+		processMessage(data)
 	}
 }
 
-func main() {
-	defer logFile.Close()
-	go tcpListener()
+func processMessage(data map[string]interface{}) {
+	jsonStr, _ := json.Marshal(data)
+	log.Println("Received: ", string(jsonStr))
 
-	http.HandleFunc("/log", httpHandler)
-	log.Println("HTTP listening on :8080 and TCP on :9000")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Minimize/compact the JSON
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, jsonStr); err != nil {
+		// log.Println("Failed to compact JSON:", err)
+		return
+	}
+	logFile.Write(compacted.Bytes())
+	logFile.Write([]byte("\n"))
+
+	flatMap := make(map[string]string)
+	flattenJSON("", data, flatMap)
+	labels := make(map[string]string)
+	message := flatMap[DotEnvVariable("LOG_MESSAGE_FIELD")]
+	timestamp, _ := time.Parse(DotEnvVariable("LOG_TIMESTAMP_FORMAT"), flatMap[DotEnvVariable("LOG_TIMESTAMP_FIELD")])
+	for key, value := range flatMap {
+		if key == DotEnvVariable("LOG_TIMESTAMP_FIELD") || key == DotEnvVariable("LOG_MESSAGE_FIELD") {
+			continue
+		}
+		labels[strings.Replace(key, "-", "_", -1)] = fmt.Sprintf("%v", value)
+	}
+	logMsg := LokiStream{
+		Stream: labels,
+		Values: [][]string{
+			{
+				fmt.Sprintf("%d", timestamp.UnixNano()),
+				message,
+			},
+		},
+	}
+
+	batchLock.Lock()
+	batch = append(batch, logMsg)
+	batchLock.Unlock()
+}
+
+// flattenJSON recursively flattens a nested JSON object into map[string]string
+func flattenJSON(prefix string, in map[string]interface{}, out map[string]string) {
+	for k, v := range in {
+		key := k
+		if prefix != "" {
+			key = prefix + "_" + k
+		}
+
+		switch value := v.(type) {
+		case map[string]interface{}:
+			flattenJSON(key, value, out)
+		case string:
+			out[key] = value
+		case float64:
+			out[key] = fmt.Sprintf("%v", value)
+		case bool:
+			out[key] = fmt.Sprintf("%t", value)
+		default:
+			out[key] = fmt.Sprintf("%v", value)
+		}
+	}
+}
+
+func batchSender() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		batchLock.Lock()
+		if len(batch) == 0 {
+			batchLock.Unlock()
+			continue
+		}
+		toSend := batch
+		batch = nil
+		batchLock.Unlock()
+
+		sendToLoki(toSend)
+	}
+}
+
+func sendToLoki(streams []LokiStream) {
+	if len(streams) == 0 {
+		return
+	}
+
+	body := map[string]interface{}{
+		"streams": streams,
+	}
+
+	jsonBody, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", DotEnvVariable("LOKI_URL"), bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(DotEnvVariable("LOKI_USERNAME"), DotEnvVariable("LOKI_PASSWORD"))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Println("Failed to send to Loki:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		log.Printf("Loki error status %d, detail: %s\n", resp.StatusCode, string(bodyBytes))
+	} else {
+		log.Println("Sent batch to Loki")
+	}
 }
