@@ -16,9 +16,15 @@ import (
 )
 
 var (
-	logFile   *os.File
-	batchLock sync.Mutex
-	batch     []LokiStream
+	logFile            *os.File
+	batchLock          sync.Mutex
+	batch              []LokiStream
+	logMessageField    = DotEnvVariable("LOG_MESSAGE_FIELD")
+	logTimestampField  = DotEnvVariable("LOG_TIMESTAMP_FIELD")
+	logTimestampFormat = DotEnvVariable("LOG_TIMESTAMP_FORMAT")
+	lokiUrl            = DotEnvVariable("LOKI_URL")
+	lokiUsername       = DotEnvVariable("LOKI_USERNAME")
+	lokiPassword       = DotEnvVariable("LOKI_PASSWORD")
 )
 
 type LokiStream struct {
@@ -32,8 +38,8 @@ type LokiPayload struct {
 
 func main() {
 	initLogger()
-	go startHTTP(":8080")
-	go startTCP(":9000")
+	go startHTTP(":" + DotEnvVariable("PORT_HTTP"))
+	go startTCP(":" + DotEnvVariable("PORT_TCP"))
 	go batchSender()
 
 	select {}
@@ -111,10 +117,10 @@ func processMessage(data map[string]interface{}) {
 	flatMap := make(map[string]string)
 	flattenJSON("", data, flatMap)
 	labels := make(map[string]string)
-	message := flatMap[DotEnvVariable("LOG_MESSAGE_FIELD")]
-	timestamp, _ := time.Parse(DotEnvVariable("LOG_TIMESTAMP_FORMAT"), flatMap[DotEnvVariable("LOG_TIMESTAMP_FIELD")])
+	message := flatMap[logMessageField]
+	timestamp, _ := time.Parse(logTimestampFormat, flatMap[logTimestampField])
 	for key, value := range flatMap {
-		if key == DotEnvVariable("LOG_TIMESTAMP_FIELD") || key == DotEnvVariable("LOG_MESSAGE_FIELD") {
+		if key == logTimestampField || key == logMessageField {
 			continue
 		}
 		labels[strings.Replace(key, "-", "_", -1)] = fmt.Sprintf("%v", value)
@@ -185,9 +191,13 @@ func sendToLoki(streams []LokiStream) {
 	}
 
 	jsonBody, _ := json.Marshal(body)
-	req, _ := http.NewRequest("POST", DotEnvVariable("LOKI_URL"), bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequest("POST", lokiUrl, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		log.Printf("Failed to create request: %v", err)
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(DotEnvVariable("LOKI_USERNAME"), DotEnvVariable("LOKI_PASSWORD"))
+	req.SetBasicAuth(lokiUsername, lokiPassword)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -200,6 +210,6 @@ func sendToLoki(streams []LokiStream) {
 	if resp.StatusCode >= 300 {
 		log.Printf("Loki error status %d, detail: %s\n", resp.StatusCode, string(bodyBytes))
 	} else {
-		log.Println("Sent batch to Loki")
+		log.Println("Sent batch to Loki:", len(streams), "messages")
 	}
 }
