@@ -123,7 +123,9 @@ func processMessage(data map[string]interface{}) {
 		if key == logTimestampField || key == logMessageField {
 			continue
 		}
-		labels[strings.Replace(key, "-", "_", -1)] = fmt.Sprintf("%v", value)
+		formattedKey := strings.Replace(key, "-", "_", -1)
+		formattedKey = strings.Replace(formattedKey, ".", "_", -1)
+		labels[formattedKey] = fmt.Sprintf("%v", value)
 	}
 	logMsg := LokiStream{
 		Stream: labels,
