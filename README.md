@@ -34,4 +34,8 @@ docker build --platform linux/amd64 -t simple-log-proxy .
 
 ## Run
 docker run --rm -p 8080:8080 -p 9090:9090 --env-file .env simple-log-proxy
+
+## Build and push
+docker build --platform linux/amd64 -t icovn/simple_log_proxy:1.0.0 .
+docker push icovn/simple_log_proxy:1.0.0
 ```
